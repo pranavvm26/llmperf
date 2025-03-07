@@ -3,7 +3,7 @@ import json
 import os
 import time
 from typing import Any, Dict
-
+import logging 
 import boto3
 import ray
 from transformers import LlamaTokenizerFast
@@ -34,7 +34,7 @@ class SageMakerClient(LLMClient):
 
         prompt = request_config.prompt
         prompt, prompt_len = prompt
-
+        
         message = [
             {"role": "system", "content": ""},
             {"role": "user", "content": prompt},
@@ -46,21 +46,17 @@ class SageMakerClient(LLMClient):
 
         sampling_params = request_config.sampling_params
 
-        if "max_tokens" in sampling_params:
-            sampling_params["max_new_tokens"] = sampling_params["max_tokens"]
-            del sampling_params["max_tokens"]
+        # if "max_tokens" in sampling_params:
+        #     sampling_params["max_new_tokens"] = sampling_params["max_tokens"]
+        #     del sampling_params["max_tokens"]
 
-        message = {
-            "inputs": [
-                [
-                    {"role": "system", "content": ""},
-                    {"role": "user", "content": prompt},
-                ]
-            ],
-            "parameters": {
-                **request_config.sampling_params,
-            },
-        }
+        message = {**request_config.sampling_params}
+        message["stream"] = True
+
+        message["messages"] = [
+            {"role": "system", "content": ""},
+            {"role": "user", "content": prompt},
+        ]
 
         time_to_next_token = []
         tokens_received = 0
@@ -82,19 +78,39 @@ class SageMakerClient(LLMClient):
                 Body=json.dumps(message),
                 CustomAttributes="accept_eula=true",
             )
-
             event_stream = response["Body"]
-            json_byte = b""
+            json_byte_list = []
+
+            i_t = 0
             for line, ttft, _ in LineIterator(event_stream):
-                json_byte += line
-                time_to_next_token.append(
-                    time.monotonic() - most_recent_received_token_time
-                )
-                most_recent_received_token_time = time.monotonic()
-            ttft = ttft - start_time
-            resp = json.loads(json_byte)
+                if i_t < 1:
+                    ttft_0 = ttft
+                i_t += 1
+                if not line.strip():
+                    continue
+                if line == "[DONE]":
+                    break
+                try:
+                    json_chunk = json.loads(line)
+                    json_byte_list.append(json_chunk) 
+            
+                    # Capture token timing
+                    time_to_next_token.append(
+                        time.monotonic() - 
+                        most_recent_received_token_time
+                    )
+                    most_recent_received_token_time = time.monotonic()
+                
+                except json.JSONDecodeError:
+                    print("Error decoding JSON:", line)
+                    continue
+            
+            ttft = ttft_0 - start_time
             total_request_time = time.monotonic() - start_time
-            generated_text = resp[0]["generation"]["content"]
+            generated_text = "".join(
+                chunk['choices'][0].get('delta', {}).get('content', '') 
+                for chunk in json_byte_list
+            )
             tokens_received = len(self.tokenizer.encode(generated_text))
             output_throughput = tokens_received / total_request_time
 
@@ -106,7 +122,8 @@ class SageMakerClient(LLMClient):
 
         metrics[common_metrics.ERROR_MSG] = error_msg
         metrics[common_metrics.ERROR_CODE] = error_response_code
-        metrics[common_metrics.INTER_TOKEN_LAT] = time_to_next_token
+        # metrics[common_metrics.INTER_TOKEN_LAT] = time_to_next_token
+        metrics[common_metrics.INTER_TOKEN_LAT] = sum(time_to_next_token)
         metrics[common_metrics.TTFT] = ttft
         metrics[common_metrics.E2E_LAT] = total_request_time
         metrics[common_metrics.REQ_OUTPUT_THROUGHPUT] = output_throughput
@@ -120,7 +137,6 @@ class SageMakerClient(LLMClient):
 class LineIterator:
     """
     A helper class for parsing the byte stream input.
-    Reference: https://aws.amazon.com/blogs/machine-learning/elevating-the-generative-ai-experience-introducing-streaming-support-in-amazon-sagemaker-hosting/
     """
 
     def __init__(self, stream):
@@ -140,11 +156,20 @@ class LineIterator:
                 if self.ttft == 0:
                     self.ttft = time.monotonic()
                 self.read_pos += len(line)
-                return line[:-1], self.ttft, time.monotonic()
-            # kyle: dealing with last ']' for chat output
+
+                # Strip "data: " from each chunk
+                decoded_line = line.decode("utf-8").strip()
+                if decoded_line.startswith("data: "):
+                    decoded_line = decoded_line[6:]
+
+                return decoded_line, self.ttft, time.monotonic()
             if line and self.read_pos == self.buffer.getbuffer().nbytes - 1:
                 self.read_pos += 1
-                return line, self.ttft, time.monotonic()
+                # Strip "data: " from each chunk
+                decoded_line = line.decode("utf-8").strip()
+                if decoded_line.startswith("data: "):
+                    decoded_line = decoded_line[6:]
+                return decoded_line, self.ttft, time.monotonic()
             try:
                 chunk = next(self.byte_iterator)
             except StopIteration:
@@ -152,7 +177,7 @@ class LineIterator:
                     continue
                 raise
             if "PayloadPart" not in chunk:
-                print("Unknown event type:" + chunk)
+                print("Unknown event type:", chunk)
                 continue
             self.buffer.seek(0, io.SEEK_END)
             self.buffer.write(chunk["PayloadPart"]["Bytes"])

@@ -85,6 +85,8 @@ TBD
 
 ## Metrics
 
+![Metrics Table](./llm-benchmarking-screenshot.png)
+
 Each concurrency step reports two tables (Latency Metrics and Throughput & Token Metrics) with percentiles (p25, p50, p75, p90, p95, p99), mean, min, max, and stddev. A summary panel follows with aggregate stats.
 
 ### Latency Metrics

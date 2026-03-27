@@ -1,5 +1,7 @@
 # AWS LLM-Perf
 
+![Metrics Screenshot](./finalized-metrics.png)
+
 A CLI tool for benchmarking LLM endpoints on AWS (SageMaker, Bedrock) and other providers. Uses [LiteLLM](https://docs.litellm.ai/docs/providers) as the gateway.
 
 > This is a fork of [ray-project/llmperf](https://github.com/ray-project/llmperf) with the following changes:

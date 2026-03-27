@@ -13,7 +13,7 @@ A CLI tool for benchmarking LLM endpoints on AWS (SageMaker, Bedrock) and other 
 ## Setup
 
 ```bash
-git clone https://github.com/pranavvm26/aws-llmperf.git
+git clone https://github.com/pranavvm26/llmperf.git
 cd aws-llmperf
 
 pip install uv

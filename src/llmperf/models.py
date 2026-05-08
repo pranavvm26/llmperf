@@ -19,3 +19,5 @@ class RequestConfig(BaseModel):
     sampling_params: Optional[Dict[str, Any]] = None
     llm_api: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
+    tokenizer_name: Optional[str] = None
+    inference_component_name: Optional[str] = None

@@ -1,60 +1,85 @@
+"""Direct SageMaker client using boto3.
+
+Bypasses LiteLLM entirely. Sends OpenAI-compatible chat payloads
+directly to SageMaker endpoints via invoke_endpoint_with_response_stream.
+Supports both text and vision (multimodal) prompts.
+"""
+
 import io
 import json
 import os
 import time
 from typing import Any, Dict
-import logging 
+
 import boto3
 import ray
-from llmperf.tokenizer_factory import get_tokenizer
 
 from llmperf.ray_llm_client import LLMClient
 from llmperf.models import RequestConfig
 from llmperf import common_metrics
+from llmperf.tokenizer_factory import get_tokenizer
 
 
 @ray.remote
-class SageMakerClient(LLMClient):
-    """Client for OpenAI Chat Completions API."""
+class SageMakerDirectClient(LLMClient):
+    """Direct boto3 client for SageMaker endpoints."""
 
     def __init__(self):
         self._tokenizer = None
+        self._sm_runtime = None
+
+    def _get_runtime(self):
+        if self._sm_runtime is None:
+            region = (
+                os.environ.get("AWS_REGION_NAME")
+                or os.environ.get("AWS_REGION")
+                or os.environ.get("AWS_DEFAULT_REGION")
+            )
+            if not region:
+                raise ValueError("AWS_REGION_NAME or AWS_REGION must be set.")
+            self._sm_runtime = boto3.client("sagemaker-runtime", region_name=region)
+        return self._sm_runtime
 
     def llm_request(self, request_config: RequestConfig) -> Dict[str, Any]:
-        if not os.environ.get("AWS_ACCESS_KEY_ID"):
-            raise ValueError("AWS_ACCESS_KEY_ID must be set.")
-        if not os.environ.get("AWS_SECRET_ACCESS_KEY"):
-            raise ValueError("AWS_SECRET_ACCESS_KEY must be set.")
-        if not os.environ.get("AWS_REGION_NAME"):
-            raise ValueError("AWS_REGION_NAME must be set.")
+        import json as _json
 
         prompt = request_config.prompt
-        prompt, prompt_len = prompt
-        
-        message = [
-            {"role": "system", "content": ""},
-            {"role": "user", "content": prompt},
-        ]
-        model = request_config.model
+        prompt_text, prompt_len = prompt
+
         if self._tokenizer is None:
             self._tokenizer = get_tokenizer(request_config.tokenizer_name)
-        sm_runtime = boto3.client(
-            "sagemaker-runtime", region_name=os.environ.get("AWS_REGION_NAME")
-        )
 
-        sampling_params = request_config.sampling_params
+        # Extract endpoint name from model string
+        # Supports: "sagemaker/endpoint-name", "sagemaker_direct/endpoint-name", or just "endpoint-name"
+        model = request_config.model
+        for prefix in ("sagemaker_direct/", "sagemaker/", "sagemaker_chat/"):
+            if model.startswith(prefix):
+                model = model[len(prefix):]
+                break
 
-        # if "max_tokens" in sampling_params:
-        #     sampling_params["max_new_tokens"] = sampling_params["max_tokens"]
-        #     del sampling_params["max_tokens"]
+        # Build OpenAI-compatible message content
+        # Detect multimodal (JSON-serialized content parts)
+        try:
+            content_parts = _json.loads(prompt_text)
+            if isinstance(content_parts, list) and any(
+                isinstance(p, dict) and p.get("type") == "image_url"
+                for p in content_parts
+            ):
+                user_content = content_parts
+            else:
+                user_content = prompt_text
+        except (ValueError, TypeError, _json.JSONDecodeError):
+            user_content = prompt_text
 
-        message = {**request_config.sampling_params}
-        message["stream"] = True
+        messages = [{"role": "user", "content": user_content}]
 
-        message["messages"] = [
-            {"role": "system", "content": ""},
-            {"role": "user", "content": prompt},
-        ]
+        # Build request payload
+        sampling_params = dict(request_config.sampling_params or {})
+        payload = {
+            "messages": messages,
+            "stream": True,
+            **sampling_params,
+        }
 
         time_to_next_token = []
         tokens_received = 0
@@ -70,57 +95,56 @@ class SageMakerClient(LLMClient):
         most_recent_received_token_time = time.monotonic()
 
         try:
-            response = sm_runtime.invoke_endpoint_with_response_stream(
-                EndpointName=model,
-                ContentType="application/json",
-                Body=json.dumps(message),
-                CustomAttributes="accept_eula=true",
-            )
+            sm_runtime = self._get_runtime()
+            invoke_kwargs = {
+                "EndpointName": model,
+                "ContentType": "application/json",
+                "Body": _json.dumps(payload),
+                "CustomAttributes": "accept_eula=true",
+            }
+            if request_config.inference_component_name:
+                invoke_kwargs["InferenceComponentName"] = request_config.inference_component_name
+            response = sm_runtime.invoke_endpoint_with_response_stream(**invoke_kwargs)
             event_stream = response["Body"]
             json_byte_list = []
+            ttft_captured = False
 
-            i_t = 0
-            for line, ttft, _ in LineIterator(event_stream):
-                if i_t < 1:
-                    ttft_0 = ttft
-                i_t += 1
+            for line, line_ttft, _ in _LineIterator(event_stream):
                 if not line.strip():
                     continue
                 if line == "[DONE]":
                     break
                 try:
-                    json_chunk = json.loads(line)
-                    json_byte_list.append(json_chunk) 
-            
-                    # Capture token timing
+                    json_chunk = _json.loads(line)
+                    json_byte_list.append(json_chunk)
+
+                    if not ttft_captured:
+                        ttft = line_ttft - start_time
+                        ttft_captured = True
+
                     time_to_next_token.append(
-                        time.monotonic() - 
-                        most_recent_received_token_time
+                        time.monotonic() - most_recent_received_token_time
                     )
                     most_recent_received_token_time = time.monotonic()
-                
-                except json.JSONDecodeError:
-                    print("Error decoding JSON:", line)
+
+                except _json.JSONDecodeError:
                     continue
-            
-            ttft = ttft_0 - start_time
+
             total_request_time = time.monotonic() - start_time
             generated_text = "".join(
-                chunk['choices'][0].get('delta', {}).get('content', '') 
+                chunk.get("choices", [{}])[0].get("delta", {}).get("content", "")
                 for chunk in json_byte_list
             )
             tokens_received = len(self._tokenizer.encode(generated_text))
-            output_throughput = tokens_received / total_request_time
+            if total_request_time > 0:
+                output_throughput = tokens_received / total_request_time
 
         except Exception as e:
-            print(f"Warning Or Error: {e}")
-            print(error_response_code)
             error_msg = str(e)
             error_response_code = 500
 
         metrics[common_metrics.ERROR_MSG] = error_msg
         metrics[common_metrics.ERROR_CODE] = error_response_code
-        # metrics[common_metrics.INTER_TOKEN_LAT] = time_to_next_token
         metrics[common_metrics.INTER_TOKEN_LAT] = sum(time_to_next_token)
         metrics[common_metrics.TTFT] = ttft
         metrics[common_metrics.E2E_LAT] = total_request_time
@@ -132,10 +156,8 @@ class SageMakerClient(LLMClient):
         return metrics, generated_text, request_config
 
 
-class LineIterator:
-    """
-    A helper class for parsing the byte stream input.
-    """
+class _LineIterator:
+    """Parse SSE byte stream from SageMaker streaming response."""
 
     def __init__(self, stream):
         self.byte_iterator = iter(stream)
@@ -154,16 +176,12 @@ class LineIterator:
                 if self.ttft == 0:
                     self.ttft = time.monotonic()
                 self.read_pos += len(line)
-
-                # Strip "data: " from each chunk
                 decoded_line = line.decode("utf-8").strip()
                 if decoded_line.startswith("data: "):
                     decoded_line = decoded_line[6:]
-
                 return decoded_line, self.ttft, time.monotonic()
             if line and self.read_pos == self.buffer.getbuffer().nbytes - 1:
                 self.read_pos += 1
-                # Strip "data: " from each chunk
                 decoded_line = line.decode("utf-8").strip()
                 if decoded_line.startswith("data: "):
                     decoded_line = decoded_line[6:]
@@ -175,7 +193,6 @@ class LineIterator:
                     continue
                 raise
             if "PayloadPart" not in chunk:
-                print("Unknown event type:", chunk)
                 continue
             self.buffer.seek(0, io.SEEK_END)
             self.buffer.write(chunk["PayloadPart"]["Bytes"])

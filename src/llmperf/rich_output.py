@@ -150,6 +150,16 @@ def print_summary_panel(results: dict):
     if num_errors > 0:
         grid.add_row("Error Code Frequency", f"[yellow]{error_freq}[/]")
 
+    # Show error messages if available
+    error_messages = results.get("error_messages", [])
+    if error_messages:
+        grid.add_row("", "")
+        grid.add_row("Sample Error Messages", "")
+        for i, msg in enumerate(error_messages[:3]):
+            # Truncate long messages
+            msg_str = str(msg)[:200]
+            grid.add_row(f"  [{i+1}]", f"[red]{msg_str}[/]")
+
     console.print(Panel(grid, title="Summary", border_style="cyan",
                         title_align="left", box=box.HEAVY))
 

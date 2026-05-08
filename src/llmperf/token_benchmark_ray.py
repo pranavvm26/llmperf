@@ -21,12 +21,14 @@ from llmperf.models import RequestConfig
 from llmperf.requests_launcher import RequestsLauncher
 from llmperf.utils import (
     randomly_sample_sonnet_lines_prompt,
+    generate_vision_prompt,
     LLMPerfResults,
     sample_random_positive_int,
 )
 
-from transformers import LlamaTokenizerFast
 from llmperf.rich_output import print_results, console
+from llmperf.tokenizer_factory import get_tokenizer
+from llmperf.report import generate_report
 
 from rich.progress import (
     Progress,
@@ -90,6 +92,8 @@ def _run_warmup(
     prompts: List[str],
     num_output_tokens_list: List[int],
     additional_sampling_params: Dict[str, Any],
+    tokenizer_name: str = "",
+    inference_component_name: str = None,
 ):
     """Send warmup requests to prime the endpoint before benchmarking."""
     console.print(f"\n[dim]Warming up endpoint with {num_warmup_requests} request(s)...[/dim]")
@@ -114,6 +118,8 @@ def _run_warmup(
                 prompt=prompts[idx],
                 sampling_params=default_sampling_params,
                 llm_api=llm_api,
+                tokenizer_name=tokenizer_name,
+                inference_component_name=inference_component_name,
             )
             req_launcher.launch_requests(request_config)
             outs = req_launcher.get_next_ready(block=True)
@@ -134,6 +140,9 @@ def get_token_throughput_latencies(
     test_timeout_s=90,
     llm_api="openai",
     num_warmup_requests: int = 0,
+    tokenizer_name: str = "",
+    modality: str = "text",
+    inference_component_name: str = None,
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     """Get the token throughput and latencies for the given model.
 
@@ -150,6 +159,8 @@ def get_token_throughput_latencies(
         test_timeout_s: The amount of time to run the test for before reporting results.
         llm_api: The name of the llm api to use. Either "openai" or "litellm".
         num_warmup_requests: Number of warmup requests to send before benchmarking.
+        tokenizer_name: HuggingFace tokenizer identifier (required).
+        modality: Prompt modality — "text" or "vision".
 
     Returns:
         A summary of the performance metrics collected across all completed requests
@@ -158,9 +169,9 @@ def get_token_throughput_latencies(
     """
     random.seed(11111)
 
-    tokenizer = LlamaTokenizerFast.from_pretrained(
-        "hf-internal-testing/llama-tokenizer"
-    )
+    tokenizer = get_tokenizer(tokenizer_name)
+    console.print(f"[dim]Tokenizer:[/dim] {tokenizer_name}")
+    console.print(f"[dim]Modality:[/dim] {modality}")
     get_token_length = lambda text: len(tokenizer.encode(text))
 
     if not additional_sampling_params:
@@ -178,12 +189,18 @@ def get_token_throughput_latencies(
         ))
         num_output_tokens_list.append(num_output_tokens)
 
-        prompts.append(randomly_sample_sonnet_lines_prompt(
-            prompt_tokens_mean=mean_input_tokens,
-            prompt_tokens_stddev=stddev_input_tokens,
-            expect_output_tokens=num_output_tokens,
-            tokenizer=tokenizer
-        ))
+        if modality == "vision":
+            prompts.append(generate_vision_prompt(
+                expect_output_tokens=num_output_tokens,
+                tokenizer=tokenizer,
+            ))
+        else:
+            prompts.append(randomly_sample_sonnet_lines_prompt(
+                prompt_tokens_mean=mean_input_tokens,
+                prompt_tokens_stddev=stddev_input_tokens,
+                expect_output_tokens=num_output_tokens,
+                tokenizer=tokenizer,
+            ))
 
     # Run warmup if requested
     if num_warmup_requests > 0:
@@ -194,6 +211,8 @@ def get_token_throughput_latencies(
             prompts=prompts,
             num_output_tokens_list=num_output_tokens_list,
             additional_sampling_params=additional_sampling_params,
+            tokenizer_name=tokenizer_name,
+            inference_component_name=inference_component_name,
         )
 
     start_time = time.monotonic()
@@ -222,6 +241,8 @@ def get_token_throughput_latencies(
                 prompt=prompts[request_index],
                 sampling_params=default_sampling_params,
                 llm_api=llm_api,
+                tokenizer_name=tokenizer_name,
+                inference_component_name=inference_component_name,
             )
             req_launcher.launch_requests(request_config)
 
@@ -232,8 +253,9 @@ def get_token_throughput_latencies(
                 num_output_tokens = get_token_length(gen_text)
                 with completed_requests_lock:
                     if num_completed_requests < max_num_completed_requests:
-                        if num_output_tokens:
-                            request_metrics[common_metrics.INTER_TOKEN_LAT] /= request_metrics[common_metrics.NUM_OUTPUT_TOKENS]
+                        orig_output_tokens = request_metrics.get(common_metrics.NUM_OUTPUT_TOKENS, 0)
+                        if orig_output_tokens and orig_output_tokens > 0:
+                            request_metrics[common_metrics.INTER_TOKEN_LAT] /= orig_output_tokens
                         else:
                             request_metrics[common_metrics.INTER_TOKEN_LAT] = 0
                         request_metrics[common_metrics.NUM_OUTPUT_TOKENS] = num_output_tokens
@@ -273,8 +295,9 @@ def get_token_throughput_latencies(
         num_output_tokens = get_token_length(gen_text)
         with completed_requests_lock:
             if num_completed_requests < max_num_completed_requests:
-                if num_output_tokens:
-                    request_metrics[common_metrics.INTER_TOKEN_LAT] /= num_output_tokens
+                orig_output_tokens = request_metrics.get(common_metrics.NUM_OUTPUT_TOKENS, 0)
+                if orig_output_tokens and orig_output_tokens > 0:
+                    request_metrics[common_metrics.INTER_TOKEN_LAT] /= orig_output_tokens
                 else:
                     request_metrics[common_metrics.INTER_TOKEN_LAT] = 0
                 request_metrics[common_metrics.NUM_OUTPUT_TOKENS] = num_output_tokens
@@ -346,6 +369,22 @@ def metrics_summary(
             else:
                 yield sub_item
 
+    if not metrics:
+        ret[common_metrics.NUM_REQ_STARTED] = 0
+        ret[common_metrics.ERROR_RATE] = 1.0
+        ret[common_metrics.NUM_ERRORS] = 0
+        ret[common_metrics.ERROR_CODE_FREQ] = "{}"
+        ret[common_metrics.OUTPUT_THROUGHPUT] = 0
+        ret[common_metrics.NUM_COMPLETED_REQUESTS] = 0
+        ret[common_metrics.COMPLETED_REQUESTS_PER_MIN] = 0
+        for key in [
+            common_metrics.INTER_TOKEN_LAT, common_metrics.TTFT,
+            common_metrics.E2E_LAT, common_metrics.REQ_OUTPUT_THROUGHPUT,
+            common_metrics.NUM_INPUT_TOKENS, common_metrics.NUM_OUTPUT_TOKENS,
+        ]:
+            ret[key] = {"quantiles": {}, "mean": 0, "min": 0, "max": 0, "stddev": 0}
+        return ret
+
     df = pd.DataFrame(metrics)
     df_without_errored_req = df[df[common_metrics.ERROR_CODE].isna()]
 
@@ -379,6 +418,14 @@ def metrics_summary(
     error_code_frequency = dict(error_codes.value_counts())
     ret[common_metrics.ERROR_CODE_FREQ] = str(error_code_frequency)
 
+    # Collect unique error messages for debugging
+    if num_errors > 0 and common_metrics.ERROR_MSG in df.columns:
+        error_msgs = df[common_metrics.ERROR_MSG].dropna()
+        unique_msgs = [m for m in error_msgs.unique() if m and str(m).strip()]
+        ret["error_messages"] = unique_msgs[:5]  # Keep first 5 unique messages
+    else:
+        ret["error_messages"] = []
+
     overall_output_throughput = df_without_errored_req[
         common_metrics.NUM_OUTPUT_TOKENS
     ].sum() / (end_time - start_time)
@@ -408,6 +455,9 @@ def run_token_benchmark(
     results_dir: str,
     user_metadata: Dict[str, Any],
     num_warmup_requests: int = 0,
+    tokenizer_name: str = "",
+    modality: str = "text",
+    inference_component_name: str = None,
 ):
     """
     Args:
@@ -426,6 +476,8 @@ def run_token_benchmark(
         results_dir: The directory to save the results to.
         user_metadata: Additional metadata to include in the results.
         num_warmup_requests: Number of warmup requests before benchmarking.
+        tokenizer_name: HuggingFace tokenizer identifier (required).
+        modality: Prompt modality — "text" or "vision".
     """
     if mean_input_tokens < 40:
         console.print(
@@ -461,6 +513,9 @@ def run_token_benchmark(
             num_concurrent_requests=concurrency,
             additional_sampling_params=json.loads(additional_sampling_params),
             num_warmup_requests=warmup,
+            tokenizer_name=tokenizer_name,
+            modality=modality,
+            inference_component_name=inference_component_name,
         )
 
         all_step_results.append((concurrency, summary, individual_responses))
@@ -480,6 +535,22 @@ def run_token_benchmark(
     # Print concurrency sweep summary if more than one step
     if len(concurrency_steps) > 1:
         _print_sweep_summary(all_step_results)
+
+    # Generate PDF report
+    if results_dir:
+        pdf_path = generate_report(
+            all_step_results=all_step_results,
+            model=model,
+            llm_api=llm_api,
+            tokenizer_name=tokenizer_name,
+            modality=modality,
+            mean_input_tokens=mean_input_tokens,
+            mean_output_tokens=mean_output_tokens,
+            max_num_completed_requests=max_num_completed_requests,
+            num_warmup_requests=num_warmup_requests,
+            results_dir=results_dir,
+        )
+        console.print(f"\n[green]Report saved:[/green] {pdf_path}")
 
 
 def _save_results(
@@ -695,22 +766,63 @@ def _build_parser() -> argparse.ArgumentParser:
             "Useful for priming cold endpoints like SageMaker. (default: %(default)s)"
         ),
     )
+    parser.add_argument(
+        "--tokenizer",
+        type=str,
+        required=True,
+        help=(
+            "HuggingFace tokenizer to use for token counting (required). "
+            "Examples: Qwen/Qwen3-4B, meta-llama/Llama-3.1-8B, mistralai/Mistral-7B-v0.1"
+        ),
+    )
+    parser.add_argument(
+        "--modality",
+        type=str,
+        default="text",
+        choices=["text", "vision"],
+        help=(
+            "Prompt modality: 'text' uses Shakespeare sonnets, "
+            "'vision' uses a bundled test image (lena.png). (default: %(default)s)"
+        ),
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        default=False,
+        help="Enable verbose debug output including Ray worker logs and full error messages.",
+    )
+    parser.add_argument(
+        "--inference-component-name",
+        type=str,
+        default=None,
+        help=(
+            "SageMaker Inference Component name (required for endpoints with inference components). "
+            "Only used with --llm-api sagemaker_direct."
+        ),
+    )
 
     return parser
 
 
 def main():
     """CLI entry point for sm-benchmarker."""
-    _suppress_ray_noise()
+    # Parse args first so we can check --debug before ray.init
+    parser = _build_parser()
+    args = parser.parse_args()
+
+    if args.debug:
+        console.print("[yellow]Debug mode enabled — Ray worker logs will be visible.[/yellow]\n")
+        logging.getLogger("LiteLLM").setLevel(logging.DEBUG)
+        logging.getLogger("litellm").setLevel(logging.DEBUG)
+    else:
+        _suppress_ray_noise()
+
     env_vars = dict(os.environ)
     ray.init(
         runtime_env={"env_vars": env_vars},
-        logging_level=logging.ERROR,
-        log_to_driver=False,
+        logging_level=logging.DEBUG if args.debug else logging.ERROR,
+        log_to_driver=args.debug,
     )
-
-    parser = _build_parser()
-    args = parser.parse_args()
 
     # Parse user metadata.
     user_metadata = {}
@@ -733,6 +845,9 @@ def main():
         results_dir=args.results_dir,
         user_metadata=user_metadata,
         num_warmup_requests=args.warmup_requests,
+        tokenizer_name=args.tokenizer,
+        modality=args.modality,
+        inference_component_name=args.inference_component_name,
     )
 
 

@@ -5,7 +5,7 @@ from typing import Any, Dict
 
 import ray
 import requests
-from transformers import LlamaTokenizerFast
+from llmperf.tokenizer_factory import get_tokenizer
 
 from llmperf.ray_llm_client import LLMClient
 from llmperf.models import RequestConfig
@@ -17,11 +17,7 @@ class VertexAIClient(LLMClient):
     """Client for VertexAI API."""
 
     def __init__(self):
-        # VertexAI doesn't return the number of tokens that are generated so we approximate it by
-        # using the llama tokenizer.
-        self.tokenizer = LlamaTokenizerFast.from_pretrained(
-            "hf-internal-testing/llama-tokenizer"
-        )
+        self._tokenizer = None
 
     def llm_request(self, request_config: RequestConfig) -> Dict[str, Any]:
         project_id = os.environ.get("GCLOUD_PROJECT_ID")
@@ -86,7 +82,9 @@ class VertexAIClient(LLMClient):
             # output from the endpoint is in the form:
             # {"predictions": ["Input: ... \nOutput:\n ..."]}
             generated_text = response.json()["predictions"][0].split("\nOutput:\n")[1]
-            tokens_received = len(self.tokenizer.encode(generated_text))
+            if self._tokenizer is None:
+                self._tokenizer = get_tokenizer(request_config.tokenizer_name)
+            tokens_received = len(self._tokenizer.encode(generated_text))
             ttft = -1
             output_throughput = tokens_received / total_request_time
             time_to_next_token = [
